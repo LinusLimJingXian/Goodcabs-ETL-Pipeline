@@ -1,96 +1,118 @@
+# ----------------------------------------
+# Silver Layer: Calendar Dimension
+# ----------------------------------------
+# Generates a full date spine between configurable start/end dates.
+# Enriches each date with business-ready time attributes and holiday flags.
+
 from pyspark import pipelines as dp
 from pyspark.sql import functions as F
 
+# --- Configuration ---
+# Date range is controlled via Databricks job/pipeline parameters
 start_date = spark.conf.get("start_date")
 end_date = spark.conf.get("end_date")
 
 
 @dp.materialized_view(
     name="transportation.silver.calendar",
-    comment="Calendar dimension with comprehensive date attributes and Indian holidays (2025)",
+    comment="Enriched calendar dimension with time attributes and Indian holidays",
     table_properties={
-        "quality": "transportation.silver.calendar",
+        "quality": "silver",
         "layer": "silver",
+
+        # Enable Delta Lake optimisations + change tracking
         "delta.enableChangeDataFeed": "true",
         "delta.autoOptimize.optimizeWrite": "true",
         "delta.autoOptimize.autoCompact": "true",
     },
 )
 def calendar():
+
+    # --- Generate Date Spine ---
+    # Creates a continuous sequence of dates for the reporting period
     df = spark.sql(
         f"""
         SELECT explode(sequence(
             to_date('{start_date}'),
             to_date('{end_date}'),
             interval 1 day
-        )) as date
-    """
+        )) AS date
+        """
     )
 
-    df = df.withColumn(
-        "date_key", F.date_format(F.col("date"), "yyyyMMdd").cast("int")
-    )
-
+    # --- Core Date Attributes ---
+    # Used for joins, partitioning, and time-based analytics
     df = (
-        df.withColumn("year", F.year(F.col("date")))
-        .withColumn("month", F.month(F.col("date")))
-        .withColumn("quarter", F.quarter(F.col("date")))
+        df.withColumn("date_key", F.date_format("date", "yyyyMMdd").cast("int"))
+          .withColumn("year", F.year("date"))
+          .withColumn("month", F.month("date"))
+          .withColumn("quarter", F.quarter("date"))
     )
 
+    # --- Day-Level Attributes ---
+    # Enables weekday/weekend filtering and behavioural analysis
     df = (
-        df.withColumn("day_of_month", F.dayofmonth(F.col("date")))
-        .withColumn("day_of_week", F.date_format(F.col("date"), "EEEE"))
-        .withColumn("day_of_week_abbr", F.date_format(F.col("date"), "EEE"))
-        .withColumn("day_of_week_num", F.dayofweek(F.col("date")))
+        df.withColumn("day_of_month", F.dayofmonth("date"))
+          .withColumn("day_of_week", F.date_format("date", "EEEE"))
+          .withColumn("day_of_week_abbr", F.date_format("date", "EEE"))
+          .withColumn("day_of_week_num", F.dayofweek("date"))
     )
 
+    # --- Month / Quarter Labels ---
+    # Useful for reporting layers and BI-friendly dimensions
     df = (
-        df.withColumn("month_name", F.date_format(F.col("date"), "MMMM"))
+        df.withColumn("month_name", F.date_format("date", "MMMM"))
+          .withColumn(
+              "month_year",
+              F.concat(F.date_format("date", "MMMM"), F.lit(" "), F.col("year"))
+          )
+          .withColumn(
+              "quarter_year",
+              F.concat(F.lit("Q"), F.col("quarter"), F.lit(" "), F.col("year"))
+          )
+    )
+
+    # --- Week-Level Attributes ---
+    df = (
+        df.withColumn("week_of_year", F.weekofyear("date"))
+          .withColumn("day_of_year", F.dayofyear("date"))
+    )
+
+    # --- Business Flags ---
+    # Used for segmentation in analytics (weekday vs weekend behaviour)
+    df = (
+        df.withColumn(
+            "is_weekend",
+            F.col("day_of_week_num").isin([1, 7])  # Sunday/Saturday
+        )
         .withColumn(
-            "month_year",
-            F.concat(F.date_format(F.col("date"), "MMMM"), F.lit(" "), F.col("year")),
+            "is_weekday",
+            ~F.col("day_of_week_num").isin([1, 7])
+        )
+    )
+
+    # --- Holiday Logic (India-specific) ---
+    # Hardcoded national holidays for business reporting consistency
+    df = (
+        df.withColumn(
+            "holiday_name",
+            F.when((F.month("date") == 1) & (F.dayofmonth("date") == 26), "Republic Day")
+             .when((F.month("date") == 8) & (F.dayofmonth("date") == 15), "Independence Day")
+             .when((F.month("date") == 10) & (F.dayofmonth("date") == 2), "Gandhi Jayanti")
         )
         .withColumn(
-            "quarter_year",
-            F.concat(F.lit("Q"), F.col("quarter"), F.lit(" "), F.col("year")),
+            "is_holiday",
+            F.col("holiday_name").isNotNull()
         )
     )
 
-    df = df.withColumn(
-        "week_of_year", F.weekofyear(F.col("date"))
-    ).withColumn("day_of_year", F.dayofyear(F.col("date")))
+    # --- Audit Column ---
+    # Tracks when this record was generated in the pipeline
+    df = df.withColumn("silver_processed_timestamp", F.current_timestamp())
 
-    df = df.withColumn(
-        "is_weekend",
-        F.when(F.col("day_of_week_num").isin([1, 7]), True).otherwise(False),
-    ).withColumn(
-        "is_weekday",
-        F.when(F.col("day_of_week_num").isin([1, 7]), False).otherwise(True),
-    )
-
-    df = df.withColumn(
-        "holiday_name",
-        F.when(
-            (F.col("month") == 1) & (F.col("day_of_month") == 26), F.lit("Republic Day")
-        )
-        .when(
-            (F.col("month") == 8) & (F.col("day_of_month") == 15),
-            F.lit("Independence Day"),
-        )
-        .when(
-            (F.col("month") == 10) & (F.col("day_of_month") == 2),
-            F.lit("Gandhi Jayanti"),
-        )
-        .otherwise(None),
-    ).withColumn(
-        "is_holiday", F.when(F.col("holiday_name").isNotNull(), True).otherwise(False)
-    )
-
-    df = df.withColumn(
-        "silver_processed_timestamp", F.current_timestamp()
-    )
-
-    df_silver = df.select(
+    # --- Final Projection ---
+    # Explicit column ordering for clean downstream consumption
+    return df.select(
         "date",
         "date_key",
         "year",
@@ -110,5 +132,3 @@ def calendar():
         "holiday_name",
         "silver_processed_timestamp"
     )
-
-    return df_silver
