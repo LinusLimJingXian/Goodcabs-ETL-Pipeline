@@ -1,7 +1,7 @@
 from pyspark import pipelines as dp
 from pyspark.sql.functions import col, current_timestamp
 
-# Configuration
+### Configuration
 SOURCE_PATH = "s3://goodcabs-lljx1/data-store/city"
 
 @dp.materialized_view(
